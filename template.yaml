@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: hoge
+
+Parameters:
+  BaseAMI:
+    Type: AWS::EC2::Image::Id
+    Default: ami-06098fd00463352b6
+  KeyPairWeb:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances for Web
+    Type: AWS::EC2::KeyPair::KeyName
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachGateway
+    Properties:
+      AvailabilityZone: !Select [ 0, "Fn::GetAZs": {Ref: "AWS::Region"}]
+      CidrBlock: 10.0.0.0/24
+      VpcId: !Ref VPC
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: AttachGateway
+    Properties:
+      VpcId: !Ref VPC
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  WebSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "hoge"
+      GroupName: hoge-web-sg
+      VpcId: !Ref VPC
+
+  WebProfile: 
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Path: "/"
+      Roles: 
+        - !Ref WebRole
+      InstanceProfileName: hoge-web-profile
+  WebRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+        Path: "/"
+        RoleName: hoge-web-role
+        AssumeRolePolicyDocument: 
+          Version: 2012-10-17
+          Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+        ManagedPolicyArns: 
+          - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+          - "arn:aws:iam::aws:policy/CloudWatchAgentAdminPolicy"
+
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 8
+            DeleteOnTermination: true
+            Encrypted: true
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref PublicSubnet1
+          GroupSet: 
+          - !Ref WebSecurityGroup
+      ImageId: !Ref BaseAMI
+      IamInstanceProfile: !Ref WebProfile
+      KeyName: !Ref KeyPairWeb
+      DisableApiTermination: false
+      EbsOptimized: true
+      UserData: 
+        Fn::Base64: |
+            #cloud-config
+            package_update: true
+            package_upgrade: true
+            runcmd:
+            - yum update -y
+            - yum install rubygems -y
+            - mkdir -p /var/log/httpd
+            - chmod 777 /var/log/httpd/
+            - [ sh, -c, "rpm -Uvh https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm" ]
+            - /opt/aws/amazon-cloudwatch-agent/bin/config-translator --input /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json --output /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.toml --mode ec2
+            -  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a start
+            write_files:
+            - path: /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+              owner: root
+              group: root
+              mode: '000600'
+              content: |
+                {
+                  "logs": {
+                    "logs_collected": {
+                      "files": {
+                        "collect_list": [
+                          {
+                            "file_path": "/var/log/httpd/access_log",
+                            "log_group_name": "iwasalogs",
+                            "log_stream_name": "{instance_id}"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+
+  FirehoseIAMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      RoleName: iwasa-firehose-role
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: firehose.amazonaws.com
+          Action: sts:AssumeRole
+      MaxSessionDuration: 3600
+      ManagedPolicyArns: 
+        - !Ref FirehoseAssumePolicy
+  FirehoseAssumePolicy:
+      Type: "AWS::IAM::ManagedPolicy"
+      Properties:
+          ManagedPolicyName: iwasa-firehose-policy
+          Path: "/"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource: 
+                  - !Sub 'arn:aws:s3:::${CloudWatchLogsS3Bucket}'
+                  - !Sub 'arn:aws:s3:::${CloudWatchLogsS3Bucket}/*'
+  CWLogsIAMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      RoleName: iwasa-cwlogs-role
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: logs.ap-northeast-1.amazonaws.com
+          Action: sts:AssumeRole
+      MaxSessionDuration: 3600
+      ManagedPolicyArns: 
+        - !Ref CWLogsAssumePolicy
+  CWLogsAssumePolicy:
+      Type: "AWS::IAM::ManagedPolicy"
+      Properties:
+          ManagedPolicyName: iwasa-cwlogs-policy
+          Path: "/"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - firehose:*
+                Resource: 
+                  - !Sub arn:aws:firehose:ap-northeast-1:${AWS::AccountId}:*
+  HttpdAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: iwasalogs
+      RetentionInDays: 7
+  HttpdAccessLogSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties: 
+      DestinationArn: !GetAtt 'HttpdAccessLogDeliveryStream.Arn'
+      FilterPattern: ''
+      LogGroupName: !Ref HttpdAccessLogGroup
+      RoleArn: !GetAtt 'CWLogsIAMRole.Arn'
+  HttpdAccessLogDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties: 
+      DeliveryStreamName: iwasa-firehose-deliverystream-httpdaccess
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !Sub 'arn:aws:s3:::${CloudWatchLogsS3Bucket}'
+        BufferingHints:
+          SizeInMBs: 5
+          IntervalInSeconds: 300
+        CompressionFormat: UNCOMPRESSED
+        EncryptionConfiguration:
+          NoEncryptionConfig: NoEncryption
+        ErrorOutputPrefix: ''
+        RoleARN: !GetAtt 'FirehoseIAMRole.Arn'
+  CloudWatchLogsS3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub iwasa-cwlogs-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
